@@ -1,0 +1,311 @@
+// JO Migration Intelligence - Phase 1 schema: identity, RBAC, audit only.
+// Applicant profile, assessment engine, CRM, case management, documents,
+// tasks, finance and notification models are added in their own phases
+// (see C:\Users\WORK---PC\.claude\plans\binary-finding-moon.md section 6).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPER_ADMIN
+  ADMINISTRATOR
+  CONSULTANT
+  OPERATIONS_STAFF
+  APPLICANT
+}
+
+model User {
+  id           String    @id @default(uuid())
+  fullName     String
+  email        String    @unique
+  phone        String?
+  passwordHash String
+  role         Role
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]      @relation("AuditActor")
+
+  profile          ApplicantProfile?
+  authoredRuleSets AssessmentRuleSet[] @relation("RuleSetAuthor")
+  approvedRuleSets AssessmentRuleSet[] @relation("RuleSetApprover")
+  reviewedResults  AssessmentResult[]  @relation("ResultReviewer")
+
+  @@index([role])
+}
+
+/// One row per issued refresh token, stored hashed so a leaked DB dump
+/// can't be replayed directly. Revoked on logout, rotation or reuse-detection.
+model RefreshToken {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  replacedBy  String?
+  createdAt   DateTime  @default(now())
+  createdByIp String?
+
+  @@index([userId])
+}
+
+/// Append-only record of who did what to which entity, per the brief's
+/// explicit audit-logging requirement. Written by AuditLogInterceptor.
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action     String // e.g. "user.create", "assessment_ruleset.publish"
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: applicant profile, assessment engine data, lead capture.
+// Destinations: AU, NZ, CA only. Rule numbers live in AssessmentRuleSet.config
+// (reviewed + approved data), never in code.
+// ---------------------------------------------------------------------------
+
+enum Destination {
+  AUSTRALIA
+  NEW_ZEALAND
+  CANADA
+}
+
+enum RuleSetStatus {
+  DRAFT
+  IN_REVIEW
+  PUBLISHED
+  RETIRED
+}
+
+enum AssessmentStatus {
+  IN_PROGRESS
+  SUBMITTED
+}
+
+enum ResultStatus {
+  NOT_YET_ASSESSED
+  PROFILE_INCOMPLETE
+  REQUIRES_REVIEW
+  POTENTIALLY_SUITABLE
+  ADDITIONAL_REQUIREMENTS
+  NOT_MATCHING
+}
+
+enum LeadStatus {
+  NEW_ENQUIRY
+  ASSESSMENT_COMPLETED
+  AWAITING_REVIEW
+  CONSULTATION_REQUESTED
+  CONSULTATION_SCHEDULED
+  CONSULTATION_COMPLETED
+  PROPOSAL_OFFERED
+  CONVERTED
+  NOT_PROCEEDING
+  ARCHIVED
+}
+
+/// Structured applicant profile. Linked to a User once the applicant creates
+/// an account; anonymous applicants are identified by email until then.
+model ApplicantProfile {
+  id                 String    @id @default(uuid())
+  userId             String?   @unique
+  user               User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  fullName           String
+  email              String
+  phone              String?
+  dateOfBirth        DateTime?
+  countryOfResidence String?
+  nationality        String?
+  relationshipStatus String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  education     EducationHistory[]
+  employment    EmploymentHistory[]
+  languageTests LanguageTest[]
+  assessments   MigrationAssessment[]
+  leads         Lead[]
+  consents      ConsentRecord[]
+
+  @@index([email])
+}
+
+model EducationHistory {
+  id             String           @id @default(uuid())
+  profileId      String
+  profile        ApplicantProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  qualification  String
+  fieldOfStudy   String?
+  institution    String?
+  country        String?
+  graduationYear Int?
+
+  @@index([profileId])
+}
+
+model EmploymentHistory {
+  id             String           @id @default(uuid())
+  profileId      String
+  profile        ApplicantProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  jobTitle       String
+  occupation     String?
+  employer       String?
+  country        String?
+  employmentType String?
+  startDate      DateTime?
+  endDate        DateTime?
+
+  @@index([profileId])
+}
+
+model LanguageTest {
+  id        String           @id @default(uuid())
+  profileId String
+  profile   ApplicantProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  testType  String // e.g. IELTS; the set of accepted tests is rule-set data
+  testDate  DateTime?
+  listening Decimal?         @db.Decimal(3, 1)
+  reading   Decimal?         @db.Decimal(3, 1)
+  writing   Decimal?         @db.Decimal(3, 1)
+  speaking  Decimal?         @db.Decimal(3, 1)
+  overall   Decimal?         @db.Decimal(3, 1)
+
+  @@index([profileId])
+}
+
+model MigrationPathway {
+  id          String      @id @default(uuid())
+  code        String      @unique // e.g. AU-189; catalog is data managed by admins
+  destination Destination
+  name        String
+  isActive    Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+
+  ruleSets    AssessmentRuleSet[]
+  assessments MigrationAssessment[]
+
+  @@index([destination])
+}
+
+/// Versioned, effective-dated, reviewed rule config. Only PUBLISHED sets are
+/// ever used to produce applicant results. Approver must differ from author
+/// (enforced in the service layer).
+model AssessmentRuleSet {
+  id             String           @id @default(uuid())
+  pathwayId      String
+  pathway        MigrationPathway @relation(fields: [pathwayId], references: [id])
+  version        String
+  status         RuleSetStatus    @default(DRAFT)
+  config         Json // validated against RuleSetConfig in @jo/assessment-engine
+  sourceUrl      String
+  lastReviewedAt DateTime?
+  effectiveFrom  DateTime
+  effectiveTo    DateTime?
+  authoredById   String
+  authoredBy     User             @relation("RuleSetAuthor", fields: [authoredById], references: [id])
+  approvedById   String?
+  approvedBy     User?            @relation("RuleSetApprover", fields: [approvedById], references: [id])
+  approvedAt     DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  results AssessmentResult[]
+
+  @@unique([pathwayId, version])
+  @@index([pathwayId, status, effectiveFrom])
+}
+
+model MigrationAssessment {
+  id              String           @id @default(uuid())
+  profileId       String
+  profile         ApplicantProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  pathwayId       String
+  pathway         MigrationPathway @relation(fields: [pathwayId], references: [id])
+  status          AssessmentStatus @default(IN_PROGRESS)
+  /// Hashed resume token for anonymous save-and-resume. Raw token is shown once.
+  resumeTokenHash String?          @unique
+  /// Flexible per-pathway answers; structured profile data lives in relational tables.
+  answers         Json             @default("{}")
+  submittedAt     DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  results AssessmentResult[]
+  lead    Lead?
+
+  @@index([profileId])
+  @@index([status])
+}
+
+/// Immutable per computation. A new row per re-run preserves the audit trail of
+/// assessment versions; human override is recorded beside, never over, the engine output.
+model AssessmentResult {
+  id             String              @id @default(uuid())
+  assessmentId   String
+  assessment     MigrationAssessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  ruleSetId      String?
+  ruleSet        AssessmentRuleSet?  @relation(fields: [ruleSetId], references: [id])
+  status         ResultStatus
+  totalPoints    Int?
+  output         Json // full engine output: breakdown, requirements, missing info, explanation
+  overrideStatus ResultStatus?
+  overrideReason String?
+  reviewedById   String?
+  reviewedBy     User?               @relation("ResultReviewer", fields: [reviewedById], references: [id])
+  reviewedAt     DateTime?
+  createdAt      DateTime            @default(now())
+
+  @@index([assessmentId, createdAt])
+}
+
+model ConsentRecord {
+  id            String           @id @default(uuid())
+  profileId     String
+  profile       ApplicantProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  purpose       String // e.g. "assessment_processing", "marketing_contact"
+  granted       Boolean
+  noticeVersion String // privacy notice version shown at the time
+  ipAddress     String?
+  createdAt     DateTime         @default(now())
+
+  @@index([profileId, purpose])
+}
+
+model Lead {
+  id                    String               @id @default(uuid())
+  reference             String               @unique // human-friendly, generated in service
+  profileId             String
+  profile               ApplicantProfile     @relation(fields: [profileId], references: [id])
+  assessmentId          String?              @unique
+  assessment            MigrationAssessment? @relation(fields: [assessmentId], references: [id])
+  status                LeadStatus           @default(NEW_ENQUIRY)
+  source                String               @default("assessment")
+  destination           Destination?
+  consultationRequested Boolean              @default(false)
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+  deletedAt             DateTime?
+
+  @@index([status])
+  @@index([profileId])
+}

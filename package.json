@@ -1,0 +1,24 @@
+{
+  "name": "jo-migration-intelligence",
+  "private": true,
+  "version": "0.1.0",
+  "description": "JO Migration Intelligence - Migration Readiness Assessment + internal CRM/Case Management for JO Education Consultant (Australia, New Zealand, Canada).",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev --workspace=apps/api",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "build": "npm run build --workspace=packages/schemas && npm run build --workspace=apps/api && npm run build --workspace=apps/web",
+    "test": "npm run test --workspace=packages/assessment-engine && npm run test --workspace=apps/api",
+    "test:e2e": "npm run test:e2e --workspace=apps/api",
+    "lint": "npm run lint --workspace=apps/api && npm run lint --workspace=apps/web",
+    "prisma:migrate": "npm run prisma:migrate --workspace=apps/api",
+    "prisma:generate": "npm run prisma:generate --workspace=apps/api",
+    "seed": "npm run seed --workspace=apps/api"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
